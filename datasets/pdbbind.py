@@ -51,16 +51,15 @@ class NoiseTransform(BaseTransform):
         data.res_decay_weight = torch.exp(-torch.nn.ReLU()((res_distance-6.)/10.))
         orig_ca_lig_cross_distances = (data['ligand'].pos[None,...] - data['receptor'].pos[:,None,...]).norm(dim=-1)
 
-        tr_update = torch.normal(mean=0, std=tr_sigma, size=(1, 3)).float() if tr_update is None else tr_update
+        ligand_sigma = torch.clamp(tr_sigma + torch.normal(mean=0., std=0.2, size=(1,)).float(),min=0., max=1.)[0]
+        tr_update = data['ligand'].docked_trans * ligand_sigma if tr_update is None else tr_update
         tr_update_norm = tr_update.norm(dim=-1).item()
         # x = np.random.randn(3)
         # x /= np.linalg.norm(x)
         # rot_update = torch.tensor(x).float()[None,...] * torch.clamp(torch.normal(mean=0., std=rot_sigma, size=(1,)).float(),min=-np.pi, max=np.pi)[0] if rot_update is None else rot_update
-        if rot_update is None:
-            # rot_update = torch.normal(mean=0, std=rot_sigma, size=(1, 3))
-            rot_update = torch.tensor(so3.sample_vec(eps=rot_sigma)).float()[None,...]
+        rot_update = data['ligand'].docked_rot * ligand_sigma if rot_update is None else rot_update
 
-        torsion_updates = np.random.normal(loc=0.0, scale=tor_sigma, size=data['ligand'].edge_mask.sum()) if torsion_updates is None else torsion_updates
+        torsion_updates = data['ligand'].docked_torsion * ligand_sigma + torch.normal(mean=0, std=0.3, size=(data['ligand'].edge_mask.sum(), 1)).float() if torsion_updates is None else torsion_updates
         torsion_updates = None if self.no_torsion else torsion_updates
 
         res_sigma = torch.clamp(res_tr_sigma + torch.normal(mean=0., std=0.2, size=(1,)).float(),min=0., max=1.)[0]
@@ -98,7 +97,7 @@ class PDBBind(Dataset):
                  receptor_radius=30, num_workers=1, c_alpha_max_neighbors=None, popsize=15, maxiter=15,
                  matching=True, keep_original=False, max_lig_size=None, remove_hs=False, num_conformers=1, center_ligand=False, all_atoms=False,
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False, require_receptor=False,
-                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True):
+                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=True, use_existing_cache=True):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -117,7 +116,7 @@ class PDBBind(Dataset):
         self.protein_path_list = protein_path_list
         self.name_list = name_list
         self.ligand_descriptions = ligand_descriptions
-        self.keep_local_structures = keep_local_structures
+        self.keep_local_structures = keep_local_structures # keep the docked pose during inference
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
@@ -380,6 +379,7 @@ class PDBBind(Dataset):
             rec_model = parse_pdb_from_path(protein_path)
             af2_rec_model = None
             ligs = [ligand]
+            docked_ligs = [None] * len(ligs)
         else:
             try:
                 rec_model, af2_rec_model = parse_receptor(name, self.pdbbind_dir)
@@ -387,21 +387,25 @@ class PDBBind(Dataset):
                 print(f'Skipping {name} because of the error:')
                 print(e)
                 return [], []
-            ligs = read_mols(self.pdbbind_dir, name, remove_hs=False)
+            ligs, docked_ligs = read_mols(self.pdbbind_dir, name, remove_hs=False)
         rec_pdbs = [receptor_pdb]
         complex_graphs = []
         failed_indices = []
         for i, lig in enumerate(ligs):
+            docked_lig = docked_ligs[i]
             if self.max_lig_size is not None and lig.GetNumHeavyAtoms() > self.max_lig_size:
                 print(f'Ligand with {lig.GetNumHeavyAtoms()} heavy atoms is larger than max_lig_size {self.max_lig_size}. Not including {name} in preprocessed data.')
                 continue
             complex_graph = HeteroData()
             complex_graph.name = name
             if self.info is not None:
+                # need to check how to include docking scores here
+                complex_graph.docking_score = torch.tensor(self.info.loc[self.info['name']==name,'docking_score'].values[[0]]).float()
                 complex_graph.affinity = torch.tensor(self.info.loc[self.info['name']==name,'affinity'].values[[0]]).float()
                 complex_graph.gap_masks = torch.tensor([[int(x)] for x in self.info.loc[self.info['name']==name,'gap_mask'].values[0]]).float()
             try:
-                get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
+                # take in the docked ligand here to generate similar transform as the protein one
+                get_lig_graph_with_matching(lig, docked_lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
                                             self.num_conformers, remove_hs=self.remove_hs)
                 rec, rec_coords, c_alpha_coords, n_coords, c_coords, chis, chi_masks, lm_embeddings = extract_receptor_structure(copy.deepcopy(rec_model), lig, lm_embedding_chains=lm_embedding_chains)
                 rec_pdbs = [rec]
@@ -448,6 +452,7 @@ class PDBBind(Dataset):
         return complex_graphs, ligs, rec_pdbs
 
 
+# need to change this part as well
 class PDBBindScoring(Dataset):
     def __init__(self, root, transform=None, info=None, cache_path='data/cache', split_path='data/', limit_complexes=0,
                  receptor_radius=30, num_workers=1, c_alpha_max_neighbors=None, popsize=15, maxiter=15,
@@ -831,8 +836,9 @@ def read_mol(pdbbind_dir, name, remove_hs=False):
 
 def read_mols(pdbbind_dir, name, remove_hs=False):
     ligs = []
+    docked_ligs = []
     for file in os.listdir(os.path.join(pdbbind_dir, name)):
-        if file.endswith(".sdf") and 'rdkit' not in file:
+        if file.endswith(".sdf") and 'docked' not in file:
             lig = read_molecule(os.path.join(pdbbind_dir, name, file), remove_hs=remove_hs, sanitize=True)
             if '.' in MolToSmiles(lig):
                 continue
@@ -841,4 +847,8 @@ def read_mols(pdbbind_dir, name, remove_hs=False):
                 lig = read_molecule(os.path.join(pdbbind_dir, name, file[:-4] + ".mol2"), remove_hs=remove_hs, sanitize=True)
             if lig is not None:
                 ligs.append(lig)
-    return ligs
+        if file.endswith(".mol2") and 'docked' in file:
+            docked_lig = read_molecule(os.path.join(pdbbind_dir, name, file), remove_hs=remove_hs, sanitize=True)
+            if docked_lig is not None:
+                docked_ligs.append(docked_lig)
+    return ligs, docked_ligs

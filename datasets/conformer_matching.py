@@ -42,7 +42,7 @@ def optimize_rotatable_bonds(mol, true_mol, rotable_bonds, probe_id=-1, ref_id=-
                                     mutation=mutation, recombination=recombination, disp=False, seed=seed)
     opt_mol = apply_changes(opt.mol, result['x'], opt.rotable_bonds, conf_id=probe_id)
 
-    return opt_mol
+    return opt_mol, result['fun']
 
 
 class OptimizeConformer:

@@ -21,9 +21,10 @@ from torch_cluster import radius_graph
 
 import torch.nn.functional as F
 
-from datasets.conformer_matching import get_torsion_angles, optimize_rotatable_bonds
+from datasets.conformer_matching import get_torsion_angles, optimize_rotatable_bonds, SetDihedral, GetDihedral
 from utils.torsion import get_transformation_mask, get_sidechain_torsion
 from utils.affine import T
+from utils.geometry import rigid_transform_Kabsch_3D_torch
 # from utils.utils import get_align_rotran
 
 
@@ -321,46 +322,61 @@ def generate_conformer(mol):
     AllChem.MMFFOptimizeMolecule(mol, mmffVariant='MMFF94s', maxIters=500)
 
 
-def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching, keep_original, num_conformers, remove_hs):
-    if matching:
+def get_lig_graph_with_matching(mol_, docked_mol_, complex_graph, popsize, maxiter, matching, keep_original, num_conformers, remove_hs):
+    
+    if docked_mol_ is None:
+        complex_graph.rmsd_matching = 0
+        if remove_hs: mol_ = RemoveHs(mol_, sanitize=True)
+        get_lig_graph(mol_, complex_graph)
+    
+    else:
         mol_maybe_noh = copy.deepcopy(mol_)
+        docked_mol_maybe_noh = copy.deepcopy(docked_mol_)
         if remove_hs:
             mol_maybe_noh = RemoveHs(mol_maybe_noh, sanitize=True)
+            docked_mol_maybe_noh = RemoveHs(docked_mol_maybe_noh, sanitize=True)
         if keep_original:
             complex_graph['ligand'].orig_pos = mol_maybe_noh.GetConformer().GetPositions()
 
-        rotable_bonds = get_torsion_angles(mol_maybe_noh)
-        if not rotable_bonds: print("no_rotable_bonds but still using it")
-
-        for i in range(num_conformers):
-            mol_rdkit = copy.deepcopy(mol_)
-
-            mol_rdkit.RemoveAllConformers()
-            mol_rdkit = AllChem.AddHs(mol_rdkit)
-            generate_conformer(mol_rdkit)
-            if remove_hs:
-                mol_rdkit = RemoveHs(mol_rdkit, sanitize=True)
-            mol = copy.deepcopy(mol_maybe_noh)
-            if rotable_bonds:
-                optimize_rotatable_bonds(mol_rdkit, mol, rotable_bonds, popsize=popsize, maxiter=maxiter)
-            mol.AddConformer(mol_rdkit.GetConformer())
-            rms_list = []
-            AllChem.AlignMolConformers(mol, RMSlist=rms_list)
-            mol_rdkit.RemoveAllConformers()
-            mol_rdkit.AddConformer(mol.GetConformers()[1])
-
-            if i == 0:
-                complex_graph.rmsd_matching = rms_list[0]
-                get_lig_graph(mol_rdkit, complex_graph)
-            else:
-                if torch.is_tensor(complex_graph['ligand'].pos):
-                    complex_graph['ligand'].pos = [complex_graph['ligand'].pos]
-                complex_graph['ligand'].pos.append(torch.from_numpy(mol_rdkit.GetConformer().GetPositions()).float())
-
-    else:  # no matching
-        complex_graph.rmsd_matching = 0
-        if remove_hs: mol_ = RemoveHs(mol_)
-        get_lig_graph(mol_, complex_graph)
+        # need to check if the docked mol and mol represent the same molecules
+        docked_smiles = Chem.MolToSmiles(docked_mol_maybe_noh, canonical=True, isomericSmiles=True)
+        mol_smiles = Chem.MolToSmiles(mol_maybe_noh, canonical=True, isomericSmiles=True)
+        assert docked_smiles == mol_smiles, f"smiles do not match: {docked_smiles} vs {mol_smiles}"
+        
+        docked_rotable_bonds = get_torsion_angles(mol_maybe_noh)
+        mol_rotatable_bonds = get_torsion_angles(docked_mol_maybe_noh)
+        assert len(docked_rotable_bonds) == len(mol_rotatable_bonds), "number of rotable bonds do not match"
+        
+        docked_mol_to_change = copy.deepcopy(docked_mol_maybe_noh)
+        if docked_rotable_bonds:
+            docked_torsion = []
+            for i, r in enumerate(docked_rotable_bonds):
+                mol_torsion = GetDihedral(mol_maybe_noh.GetConformer(), r)
+                docked_torsion.append(GetDihedral(docked_mol_maybe_noh.GetConformer(), r))
+                SetDihedral(docked_mol_to_change.GetConformer(), r, mol_torsion)
+            docked_torsion = np.array(docked_torsion)
+        
+        mol_positions = mol_maybe_noh.GetConformer().GetPositions()
+        docked_positions = docked_mol_to_change.GetConformer().GetPositions()
+        R, t = rigid_transform_Kabsch_3D_torch(docked_positions.T, mol_positions.T)
+        docked_positions = docked_positions @ R.T + t.T
+        set_coordinates(docked_mol_to_change, docked_positions)
+        
+        if matching and docked_rotable_bonds:
+            docked_mol_to_change, rmsd = optimize_rotatable_bonds(docked_mol_to_change, mol_maybe_noh, docked_rotable_bonds, popsize=popsize, maxiter=maxiter)
+            final_torsion = []
+            for i, r in enumerate(docked_rotable_bonds):
+                final_torsion.append(GetDihedral(docked_mol_to_change.GetConformer(), r))
+            final_torsion = np.array(final_torsion)
+        
+        get_lig_graph(docked_mol_to_change, complex_graph)
+        complex_graph['ligand'].docked_trans = torch.tensor(t.T).float()
+        complex_graph['ligand'].docked_trans_sigma = torch.from_numpy(np.linalg.norm(t,axis=-1)).float()
+        complex_graph['ligand'].docked_rot = torch.from_numpy(Rotation.from_matrix(R).as_rotvec()).float()
+        complex_graph['ligand'].docked_rot_sigma = torch.from_numpy(np.linalg.norm(Rotation.from_matrix(R).as_rotvec())).float()
+        if matching and docked_rotable_bonds:
+            complex_graph.rmsd_matching = rmsd
+            complex_graph['ligand'].docked_torsion = torch.from_numpy(final_torsion - docked_torsion).float()
 
     edge_mask, mask_rotate = get_transformation_mask(complex_graph)
     complex_graph['ligand'].edge_mask = torch.tensor(edge_mask)
@@ -586,6 +602,13 @@ def write_mol_with_coords(mol, new_coords, path):
         conf.SetAtomPosition(i,Point3D(x,y,z))
     w.write(mol)
     w.close()
+    
+def set_coordinates(mol, new_coords):
+    conf = mol.GetConformer()
+    for i in range(mol.GetNumAtoms()):
+        x,y,z = new_coords.astype(np.double)[i]
+        conf.SetAtomPosition(i,Point3D(x,y,z))
+    return mol
 
 def read_molecule(molecule_file, sanitize=False, calc_charges=False, remove_hs=False):
     if molecule_file.endswith('.mol2'):
