@@ -14,6 +14,7 @@ rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (64000, rlimit[1]))
 
 import yaml
+import wandb
 
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
 from datasets.pdbbind import construct_loader
@@ -40,7 +41,6 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         logs = {}
 
         if not args.only_test:
-
             train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights)
             print("Epoch {}: Training loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, train_losses['loss'], train_losses['lddt_loss'], train_losses['affinity_loss'], train_losses['tr_loss'], train_losses['rot_loss'],
@@ -160,14 +160,19 @@ def main_function():
         torch.backends.cudnn.benchmark = True
 
     # construct loader
+    print("Constructing loader...")
     t_to_sigma = partial(t_to_sigma_compl, args=args)
     train_loader, val_loader = construct_loader(args, t_to_sigma)
+    
+    print(len(train_loader), len(val_loader))
 
+    # construct model
+    print("Constructing model...")
     model = get_model(args, device, t_to_sigma=t_to_sigma)
 
     # if len(gpus) > 1:
     #     model = DataParallel(model, device_ids=gpus, output_device=gpus[0])
-
+    print("Model constructed")
     optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
     ema_weights = ExponentialMovingAverage(model.parameters(),decay=args.ema_rate)
     start_epoch = 0
@@ -192,7 +197,7 @@ def main_function():
 
     if args.wandb:
         wandb.init(
-            entity='entity',
+            entity='kysun',
             settings=wandb.Settings(start_method="fork"),
             project=args.project,
             name=args.run_name,
@@ -211,7 +216,7 @@ def main_function():
         yaml_file_name = os.path.join(run_dir, 'model_parameters.yml')
         save_yaml_file(yaml_file_name, args.__dict__)
     args.device = device
-
+    print("Training on device:", device)
     train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, start_epoch)
 
 

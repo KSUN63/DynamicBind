@@ -10,11 +10,13 @@ def parse_train_args():
     parser.add_argument('--restart_dir', type=str, help='Folder of previous training model from which to restart')
     parser.add_argument('--cache_path', type=str, default='data/cache', help='Folder from where to load/restore cached dataset')
     parser.add_argument('--data_dir', type=str, default='data/PDBBind_af2_aligned/', help='Folder containing original structures')
+    # info path will be used to construct the loader; storing affinity gap masks and stuff
     parser.add_argument('--info_path', type=str, default='data/PDBBind_af2_aligned.csv', help='Folder containing original structures')
     parser.add_argument('--finetune_data_path', type=str, default='results/CACHE4/finetune_data.pkl', help='Folder containing original structures')
-    parser.add_argument('--split_train', type=str, default='data/splits/timesplit_no_lig_overlap_train', help='Path of file defining the split')
-    parser.add_argument('--split_val', type=str, default='data/splits/timesplit_no_lig_overlap_val', help='Path of file defining the split')
-    parser.add_argument('--split_test', type=str, default='data/splits/timesplit_test', help='Path of file defining the split')
+    # these are basically just text files containing pdb codes
+    parser.add_argument('--split_train', type=str, default='data/splits/train', help='Path of file defining the split')
+    parser.add_argument('--split_val', type=str, default='data/splits/val', help='Path of file defining the split')
+    parser.add_argument('--split_test', type=str, default='data/splits/test', help='Path of file defining the split')
     parser.add_argument('--test_sigma_intervals', action='store_true', default=False, help='Whether to log loss per noise interval')
     parser.add_argument('--val_inference_freq', type=int, default=5, help='Frequency of epochs for which to run expensive inference on val data')
     parser.add_argument('--finetune_freq', type=int, default=None, help='Frequency of epochs for which to run finetune on train data')
@@ -24,7 +26,7 @@ def parse_train_args():
     parser.add_argument('--inference_earlystop_metric', type=str, default='valinf_rmsds_lt2', help='This is the metric that is addionally used when val_inference_freq is not None')
     parser.add_argument('--inference_earlystop_goal', type=str, default='max', help='Whether to maximize or minimize metric')
     parser.add_argument('--wandb', action='store_true', default=False, help='')
-    parser.add_argument('--project', type=str, default='difdock_train', help='')
+    parser.add_argument('--project', type=str, default='dynamicbind-vina', help='')
     parser.add_argument('--run_name', type=str, default='', help='')
     parser.add_argument('--cudnn_benchmark', action='store_true', default=False, help='CUDA optimization parameter for faster training')
     parser.add_argument('--num_dataloader_workers', type=int, default=0, help='Number of workers for dataloader')
@@ -60,7 +62,8 @@ def parse_train_args():
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')
-    parser.add_argument('--affinity_weight', type=float, default=0.01, help='Weight of rotation loss')
+    # turn off affinity prediciton here
+    parser.add_argument('--affinity_weight', type=float, default=0.00, help='Weight of rotation loss')
     parser.add_argument('--tr_weight', type=float, default=0.33, help='Weight of translation loss')
     parser.add_argument('--rot_weight', type=float, default=0.33, help='Weight of rotation loss')
     parser.add_argument('--tor_weight', type=float, default=0.33, help='Weight of torsional loss')

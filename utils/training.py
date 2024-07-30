@@ -194,7 +194,7 @@ class AverageMeter():
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss'])
-
+    print("Starting training", len(loader))
     bar = tqdm(loader, total=len(loader))
     train_loss = 0.0
     train_num = 0.0
@@ -203,10 +203,13 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             print("Skipping batch of size 1 since otherwise batchnorm would not work.")
         optimizer.zero_grad()
         try:
+            print("here before the training")
             lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
+            print("successful on generating the predictions")
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
                 loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune)
             # with torch.autograd.detect_anomaly():
+            print("successful on generating the losses for the loss functions")
             loss.backward()
             optimizer.step()
             ema_weights.update(model.parameters())

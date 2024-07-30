@@ -59,7 +59,7 @@ class NoiseTransform(BaseTransform):
         # rot_update = torch.tensor(x).float()[None,...] * torch.clamp(torch.normal(mean=0., std=rot_sigma, size=(1,)).float(),min=-np.pi, max=np.pi)[0] if rot_update is None else rot_update
         rot_update = data['ligand'].docked_rot * ligand_sigma if rot_update is None else rot_update
 
-        torsion_updates = data['ligand'].docked_torsion * ligand_sigma + torch.normal(mean=0, std=0.3, size=(data['ligand'].edge_mask.sum(), 1)).float() if torsion_updates is None else torsion_updates
+        torsion_updates = data['ligand'].docked_torsion * ligand_sigma + torch.normal(mean=0, std=0.3, size=(len(data['ligand'].docked_torsion),)).float() if torsion_updates is None else torsion_updates
         torsion_updates = None if self.no_torsion else torsion_updates
 
         res_sigma = torch.clamp(res_tr_sigma + torch.normal(mean=0., std=0.2, size=(1,)).float(),min=0., max=1.)[0]
@@ -69,9 +69,9 @@ class NoiseTransform(BaseTransform):
         modify_conformer(data, tr_update, rot_update, torsion_updates, res_tr_update, res_rot_update, res_chi_update)
         data.tr_score = -tr_update
         data.rot_score = -rot_update#torch.from_numpy(so3.score_vec(vec=rot_update, eps=rot_sigma)).float().unsqueeze(0)
-        data.tor_score = None if self.no_torsion else torch.from_numpy(-torsion_updates).float()
+        data.tor_score = None if self.no_torsion else -torsion_updates
         # data.rot_loss_weight = torch.ones(1,1).float() * (tr_update_norm<10.)
-        data.tor_sigma_edge = None if self.no_torsion else np.ones(data['ligand'].edge_mask.sum()) * tor_sigma
+        data.tor_sigma_edge = None if self.no_torsion else np.ones(int(data['ligand'].edge_mask.sum().item())) * tor_sigma
         # data.tor_loss_weight = None if self.no_torsion else torch.from_numpy(np.ones(data['ligand'].edge_mask.sum()) * (tr_update_norm<10.)).float()
         data.res_tr_score = -res_tr_update
         data.res_rot_score = -res_rot_update#torch.from_numpy(so3.score_res_vec(vec=res_rot_update, eps=res_rot_sigma.cpu().numpy())).float()
@@ -95,13 +95,13 @@ class NoiseTransform(BaseTransform):
 class PDBBind(Dataset):
     def __init__(self, root, transform=None, info=None, cache_path='data/cache', split_path='data/', limit_complexes=0,
                  receptor_radius=30, num_workers=1, c_alpha_max_neighbors=None, popsize=15, maxiter=15,
-                 matching=True, keep_original=False, max_lig_size=None, remove_hs=False, num_conformers=1, center_ligand=False, all_atoms=False,
+                 matching=True, keep_original=False, max_lig_size=None, remove_hs=True, num_conformers=1, center_ligand=False, all_atoms=False,
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False, require_receptor=False,
                  ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=True, use_existing_cache=True):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
-        self.info = info
+        self.info = pd.read_csv(info,dtype={'gap_mask':str}) if os.path.exists(info) else info
         self.parallel_count = 1000
         self.max_lig_size = max_lig_size
         self.split_path = split_path
@@ -399,14 +399,20 @@ class PDBBind(Dataset):
             complex_graph = HeteroData()
             complex_graph.name = name
             if self.info is not None:
+                if not os.path.exists(self.info):
+                    complex_graph.docking_score = torch.tensor([0.0]).float()
+                    complex_graph.affinity = torch.tensor([0.0]).float()
+                    complex_graph.gap_masks = torch.tensor([[0]]).float()
+                else:
                 # need to check how to include docking scores here
-                complex_graph.docking_score = torch.tensor(self.info.loc[self.info['name']==name,'docking_score'].values[[0]]).float()
-                complex_graph.affinity = torch.tensor(self.info.loc[self.info['name']==name,'affinity'].values[[0]]).float()
-                complex_graph.gap_masks = torch.tensor([[int(x)] for x in self.info.loc[self.info['name']==name,'gap_mask'].values[0]]).float()
+                    complex_graph.docking_score = torch.tensor(self.info.loc[self.info['name']==name,'docking_score'].values[[0]]).float()
+                    complex_graph.affinity = torch.tensor(self.info.loc[self.info['name']==name,'affinity'].values[[0]]).float()
+                    complex_graph.gap_masks = torch.tensor([[int(x)] for x in self.info.loc[self.info['name']==name,'gap_mask'].values[0]]).float()
             try:
                 # take in the docked ligand here to generate similar transform as the protein one
                 get_lig_graph_with_matching(lig, docked_lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
                                             self.num_conformers, remove_hs=self.remove_hs)
+                print("Successfully generated ligand graph")
                 rec, rec_coords, c_alpha_coords, n_coords, c_coords, chis, chi_masks, lm_embeddings = extract_receptor_structure(copy.deepcopy(rec_model), lig, lm_embedding_chains=lm_embedding_chains)
                 rec_pdbs = [rec]
                 if lm_embeddings is not None and len(c_alpha_coords) != len(lm_embeddings):
@@ -414,7 +420,6 @@ class PDBBind(Dataset):
                     print(len(c_alpha_coords),len(lm_embeddings))
                     failed_indices.append(i)
                     continue
-
                 get_rec_graph(name,rec, af2_rec_model, rec_coords, c_alpha_coords, n_coords, c_coords, chis, chi_masks, complex_graph, rec_radius=self.receptor_radius,
                               c_alpha_max_neighbors=self.c_alpha_max_neighbors, all_atoms=self.all_atoms,
                               atom_radius=self.atom_radius, atom_max_neighbors=self.atom_max_neighbors, remove_hs=self.remove_hs, lm_embeddings=lm_embeddings)
@@ -798,7 +803,7 @@ def construct_loader(args, t_to_sigma):
                    'num_workers': args.num_workers, 'all_atoms': args.all_atoms,
                    'atom_radius': args.atom_radius, 'atom_max_neighbors': args.atom_max_neighbors,
                    'esm_embeddings_path': args.esm_embeddings_path}
-    info=pd.read_csv(args.info_path,dtype={'gap_mask':str})
+    info=args.info_path
     train_dataset = PDBBind(info=info,cache_path=args.cache_path, split_path=args.split_train, keep_original=True,
                             num_conformers=args.num_conformers, **common_args)
     ligand_names = []
@@ -815,7 +820,7 @@ def construct_loader(args, t_to_sigma):
     val_dataset = PDBBind(info=info,cache_path=args.cache_path, split_path=args.split_val, keep_original=True, **common_args)
 
     loader_class = DataListLoader if torch.cuda.is_available() else DataLoader
-    train_loader = loader_class(dataset=train_dataset, sampler=sampler, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, drop_last=True, pin_memory=args.pin_memory)
+    train_loader = loader_class(dataset=train_dataset, sampler=sampler, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, drop_last=False, pin_memory=args.pin_memory)
     val_loader = loader_class(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_dataloader_workers, shuffle=False, pin_memory=args.pin_memory)
 
     return train_loader, val_loader
@@ -847,7 +852,7 @@ def read_mols(pdbbind_dir, name, remove_hs=False):
                 lig = read_molecule(os.path.join(pdbbind_dir, name, file[:-4] + ".mol2"), remove_hs=remove_hs, sanitize=True)
             if lig is not None:
                 ligs.append(lig)
-        if file.endswith(".mol2") and 'docked' in file:
+        if file.endswith(".sdf") and 'docked' in file:
             docked_lig = read_molecule(os.path.join(pdbbind_dir, name, file), remove_hs=remove_hs, sanitize=True)
             if docked_lig is not None:
                 docked_ligs.append(docked_lig)

@@ -27,10 +27,6 @@ from utils.affine import T
 from utils.geometry import rigid_transform_Kabsch_3D_torch
 # from utils.utils import get_align_rotran
 
-
-biopython_pdbparser = PDBParser(QUIET=True)
-biopython_cifparser = MMCIFParser()
-
 periodic_table = GetPeriodicTable()
 allowable_features = {
     'possible_atomic_num_list': list(range(1, 119)) + ['misc'],
@@ -147,17 +143,17 @@ def parse_receptor(pdbid, pdbbind_dir):
 
 def parsePDB(pdbid, pdbbind_dir):
     file_paths = os.listdir(os.path.join(pdbbind_dir, pdbid))
-    crystal_rec_path = os.path.join(pdbbind_dir, pdbid, [path for path in file_paths if '_aligned_to_' in path][0])
-    af2_rec_path = os.path.join(pdbbind_dir, pdbid, [path for path in file_paths if 'af2_' in path][0])
+    crystal_rec_path = os.path.join(pdbbind_dir, pdbid, f"{pdbid}_aligned_to_af2.pdb")
+    af2_rec_path = os.path.join(pdbbind_dir, pdbid, f"{pdbid}_af2.pdb")
     return parse_pdb_from_path(crystal_rec_path),parse_pdb_from_path(af2_rec_path)
 
 def parse_pdb_from_path(path):
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=PDBConstructionWarning)
         if path[-4:] == '.pdb':
-            structure = biopython_pdbparser.get_structure('pdb', path)
+            structure = PDBParser().get_structure('pdb', path)
         elif path[-4:] == '.cif':
-            structure = biopython_cifparser.get_structure('cif', path)
+            structure = MMCIFParser().get_structure('cif', path)
         else:
             raise "protein is not pdb or cif"
         rec = structure[0]
@@ -328,7 +324,9 @@ def get_lig_graph_with_matching(mol_, docked_mol_, complex_graph, popsize, maxit
         complex_graph.rmsd_matching = 0
         if remove_hs: mol_ = RemoveHs(mol_, sanitize=True)
         get_lig_graph(mol_, complex_graph)
-    
+        edge_mask, mask_rotate = get_transformation_mask(complex_graph)
+        complex_graph['ligand'].edge_mask = torch.tensor(edge_mask)
+        complex_graph['ligand'].mask_rotate = mask_rotate
     else:
         mol_maybe_noh = copy.deepcopy(mol_)
         docked_mol_maybe_noh = copy.deepcopy(docked_mol_)
@@ -343,14 +341,18 @@ def get_lig_graph_with_matching(mol_, docked_mol_, complex_graph, popsize, maxit
         mol_smiles = Chem.MolToSmiles(mol_maybe_noh, canonical=True, isomericSmiles=True)
         assert docked_smiles == mol_smiles, f"smiles do not match: {docked_smiles} vs {mol_smiles}"
         
-        docked_rotable_bonds = get_torsion_angles(mol_maybe_noh)
-        mol_rotatable_bonds = get_torsion_angles(docked_mol_maybe_noh)
-        assert len(docked_rotable_bonds) == len(mol_rotatable_bonds), "number of rotable bonds do not match"
+        # renumber atoms to match the docked mol
+        atom_mapping = mol_maybe_noh.GetSubstructMatch(docked_mol_maybe_noh)
+        mol_maybe_noh = Chem.RenumberAtoms(mol_maybe_noh, atom_mapping)
+        
+        mol_rotatable_bonds = get_torsion_angles(mol_maybe_noh)
+        docked_rotatable_bonds = get_torsion_angles(docked_mol_maybe_noh)
+        assert len(docked_rotatable_bonds) == len(mol_rotatable_bonds), "number of rotable bonds do not match"
         
         docked_mol_to_change = copy.deepcopy(docked_mol_maybe_noh)
-        if docked_rotable_bonds:
+        if docked_rotatable_bonds:
             docked_torsion = []
-            for i, r in enumerate(docked_rotable_bonds):
+            for i, r in enumerate(docked_rotatable_bonds):
                 mol_torsion = GetDihedral(mol_maybe_noh.GetConformer(), r)
                 docked_torsion.append(GetDihedral(docked_mol_maybe_noh.GetConformer(), r))
                 SetDihedral(docked_mol_to_change.GetConformer(), r, mol_torsion)
@@ -358,29 +360,30 @@ def get_lig_graph_with_matching(mol_, docked_mol_, complex_graph, popsize, maxit
         
         mol_positions = mol_maybe_noh.GetConformer().GetPositions()
         docked_positions = docked_mol_to_change.GetConformer().GetPositions()
-        R, t = rigid_transform_Kabsch_3D_torch(docked_positions.T, mol_positions.T)
-        docked_positions = docked_positions @ R.T + t.T
-        set_coordinates(docked_mol_to_change, docked_positions)
+        t, R = get_align_rotran(mol_positions, docked_positions)
+        docked_positions = np.dot(docked_positions, R) + t
+        docked_mol_to_change = set_coordinates(docked_mol_to_change, docked_positions)
         
-        if matching and docked_rotable_bonds:
-            docked_mol_to_change, rmsd = optimize_rotatable_bonds(docked_mol_to_change, mol_maybe_noh, docked_rotable_bonds, popsize=popsize, maxiter=maxiter)
+        if matching and docked_rotatable_bonds:
+            docked_mol_to_change, rmsd = optimize_rotatable_bonds(docked_mol_to_change, mol_maybe_noh, docked_rotatable_bonds, popsize=popsize, maxiter=maxiter)
             final_torsion = []
-            for i, r in enumerate(docked_rotable_bonds):
+            for i, r in enumerate(docked_rotatable_bonds):
                 final_torsion.append(GetDihedral(docked_mol_to_change.GetConformer(), r))
             final_torsion = np.array(final_torsion)
         
         get_lig_graph(docked_mol_to_change, complex_graph)
-        complex_graph['ligand'].docked_trans = torch.tensor(t.T).float()
-        complex_graph['ligand'].docked_trans_sigma = torch.from_numpy(np.linalg.norm(t,axis=-1)).float()
-        complex_graph['ligand'].docked_rot = torch.from_numpy(Rotation.from_matrix(R).as_rotvec()).float()
-        complex_graph['ligand'].docked_rot_sigma = torch.from_numpy(np.linalg.norm(Rotation.from_matrix(R).as_rotvec())).float()
-        if matching and docked_rotable_bonds:
+        edge_mask, mask_rotate = get_transformation_mask(complex_graph, docked_rotatable_bonds)
+        complex_graph['ligand'].edge_mask = torch.tensor(edge_mask)
+        complex_graph['ligand'].mask_rotate = mask_rotate
+        complex_graph['ligand'].docked_trans = torch.tensor(t).float()
+        complex_graph['ligand'].docked_trans_sigma = torch.tensor(np.linalg.norm(t,axis=-1)).float()
+        complex_graph['ligand'].docked_rot = torch.tensor(Rotation.from_matrix(R.T).as_rotvec()).float()
+        complex_graph['ligand'].docked_rot_sigma = torch.tensor(np.linalg.norm(Rotation.from_matrix(R.T).as_rotvec())).float()
+        complex_graph.rmsd_matching = 0
+        complex_graph['ligand'].docked_torsion = torch.tensor([])
+        if matching and docked_rotatable_bonds:
             complex_graph.rmsd_matching = rmsd
             complex_graph['ligand'].docked_torsion = torch.from_numpy(final_torsion - docked_torsion).float()
-
-    edge_mask, mask_rotate = get_transformation_mask(complex_graph)
-    complex_graph['ligand'].edge_mask = torch.tensor(edge_mask)
-    complex_graph['ligand'].mask_rotate = mask_rotate
 
     return
 
@@ -467,6 +470,7 @@ def get_calpha_graph(name,rec, af2_rec, c_alpha_coords, n_coords, c_coords, chis
     if af2_rec is not None:
         assert ((complex_graph['ligand'].pos[None,...] - complex_graph['receptor'].pos[:,None,...]).norm(dim=-1)<15.).sum() > 0, f'{name} ligand is far away from the receptor'
         af2_rec, af2_coords, af2_c_alpha_coords, af2_n_coords, af2_c_coords, af2_chis, af2_chi_masks, af2_lm_embeddings = extract_receptor_structure(af2_rec)
+        print(len(af2_c_alpha_coords),len(c_alpha_coords))
         assert len(af2_c_alpha_coords) == len(c_alpha_coords), f'{name} af2 ca ne crystal'
         af2_trans = []
         af2_trans_sigma = []

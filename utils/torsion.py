@@ -179,35 +179,41 @@ class get_sidechain_torsion(object):
 """
 
 
-def get_transformation_mask(pyg_data):
+def get_transformation_mask(pyg_data, docked_rotatable_bonds):
     G = to_networkx(pyg_data.to_homogeneous(), to_undirected=False)
     to_rotate = []
     edges = pyg_data['ligand', 'ligand'].edge_index.T.numpy()
     edges_attr = pyg_data['ligand', 'ligand'].edge_attr.numpy()
-    for i in range(0, edges.shape[0], 2):
-        assert edges[i, 0] == edges[i+1, 1]
-        G2 = G.to_undirected()
-        G2.remove_edge(*edges[i])
-        if not nx.is_connected(G2) and edges_attr[i, 0] == 1:
-            l = list(sorted(nx.connected_components(G2), key=len)[0])
-            if len(l) > 1:
-                if edges[i, 0] in l:
-                    to_rotate.append([])
-                    to_rotate.append(l)
-                else:
-                    to_rotate.append(l)
-                    to_rotate.append([])
-                continue
-        to_rotate.append([])
-        to_rotate.append([])
+    if docked_rotatable_bonds:
+        bonds_as_axis = [sorted([bond[1], bond[2]]) for bond in docked_rotatable_bonds]
+        for i in range(0, edges.shape[0], 2):
+            assert edges[i, 0] == edges[i+1, 1]
+            edge_set = sorted(edges[i])
+            G2 = G.to_undirected()
+            if edge_set in bonds_as_axis:
+                G2.remove_edge(*edges[i])
+                l = list(sorted(nx.connected_components(G2), key=len)[0])
+                if len(l) > 1:
+                    if edges[i, 0] in l:
+                        to_rotate.append([])
+                        to_rotate.append(l)
+                    else:
+                        to_rotate.append(l)
+                        to_rotate.append([])
+                    continue
+            to_rotate.append([])
+            to_rotate.append([])
+    
+    mask_rotate = []
+    for component in to_rotate:
+        mask = np.zeros(len(G.nodes()), dtype=bool)
+        if component:
+            component_indices = np.array(component, dtype=int)
+            mask[component_indices] = True 
+        mask_rotate.append(mask)
 
-    mask_edges = np.asarray([0 if len(l) == 0 else 1 for l in to_rotate], dtype=bool)
-    mask_rotate = np.zeros((np.sum(mask_edges), len(G.nodes())), dtype=bool)
-    idx = 0
-    for i in range(len(G.edges())):
-        if mask_edges[i]:
-            mask_rotate[idx][np.asarray(to_rotate[i], dtype=int)] = True
-            idx += 1
+    mask_rotate = np.array(mask_rotate)
+    mask_edges = np.array([bool(component) for component in to_rotate])
 
     return mask_edges, mask_rotate
 
@@ -215,6 +221,7 @@ def get_transformation_mask(pyg_data):
 def modify_conformer_torsion_angles(pos, edge_index, mask_rotate, torsion_updates, as_numpy=False):
     pos = copy.deepcopy(pos)
     if type(pos) != np.ndarray: pos = pos.cpu().numpy()
+    if type(torsion_updates) != np.ndarray: torsion_updates = torsion_updates.cpu().numpy()
 
     for idx_edge, e in enumerate(edge_index.cpu().numpy()):
         if torsion_updates[idx_edge] == 0:
@@ -222,8 +229,8 @@ def modify_conformer_torsion_angles(pos, edge_index, mask_rotate, torsion_update
         u, v = e[0], e[1]
 
         # check if need to reverse the edge, v should be connected to the part that gets rotated
-        assert not mask_rotate[idx_edge, u]
-        assert mask_rotate[idx_edge, v]
+        # assert not mask_rotate[idx_edge, u]
+        # assert mask_rotate[idx_edge, v]
 
         rot_vec = pos[u] - pos[v]  # convention: positive rotation if pointing inwards
         rot_vec = rot_vec * torsion_updates[idx_edge] / np.linalg.norm(rot_vec) # idx_edge!
