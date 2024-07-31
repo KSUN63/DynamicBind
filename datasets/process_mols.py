@@ -324,7 +324,7 @@ def get_lig_graph_with_matching(mol_, docked_mol_, complex_graph, popsize, maxit
         complex_graph.rmsd_matching = 0
         if remove_hs: mol_ = RemoveHs(mol_, sanitize=True)
         get_lig_graph(mol_, complex_graph)
-        edge_mask, mask_rotate = get_transformation_mask(complex_graph)
+        edge_mask, mask_rotate = get_transformation_mask(complex_graph, None)
         complex_graph['ligand'].edge_mask = torch.tensor(edge_mask)
         complex_graph['ligand'].mask_rotate = mask_rotate
     else:
@@ -383,7 +383,7 @@ def get_lig_graph_with_matching(mol_, docked_mol_, complex_graph, popsize, maxit
         complex_graph['ligand'].docked_torsion = torch.tensor([])
         if matching and docked_rotatable_bonds:
             complex_graph.rmsd_matching = rmsd
-            complex_graph['ligand'].docked_torsion = torch.from_numpy(final_torsion - docked_torsion).float()
+            complex_graph['ligand'].docked_torsion = torch.from_numpy(docked_torsion - final_torsion).float()
 
     return
 
