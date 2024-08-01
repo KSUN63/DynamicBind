@@ -7,3 +7,4 @@
 *.npy
 data/
 __pycache__/
+wandb/
